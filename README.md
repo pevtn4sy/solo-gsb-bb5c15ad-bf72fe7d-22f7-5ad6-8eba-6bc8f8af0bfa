@@ -26,6 +26,10 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
 - **质量门禁**：按诊断类型提交 error/warning 阈值与可忽略规则（类型、路径
   glob、消息正则），服务以稳定优先级裁决每条诊断，返回 pass/fail、命中规则
   与未通过诊断（`POST /api/validations/{validation_id}/gate`）。
+- **引用路径查询**：给定导入批次与起点 / 目标文档路径，返回两者之间的最短
+  Markdown 引用链；多条等长链按路径序列字典序选定唯一结果，环不会导致查询
+  不终止，目标不可达时返回明确空结果
+  （`POST /api/imports/{import_id}/reference-path`）。
 - **修复预览**：返回受影响文档的逐行变更与完整修复后内容，**不改写代码块与正文**：
   - 锚点碰撞 → 为重复标题补充显式锚点 `{#id}`（尽量保持原锚点值不变）；
   - 断锚 → 以最相似的目标锚点重写引用片段（相似度阈值 0.6）；
@@ -89,6 +93,7 @@ pytest
 | `POST` | `/api/imports` | 导入文档集合 → `import_id` |
 | `GET` | `/api/imports/{import_id}` | 查看导入批次与文档路径 |
 | `GET` | `/api/imports/{import_id}/documents/{path}` | 读取单个文档 |
+| `POST` | `/api/imports/{import_id}/reference-path` | 查询两文档间最短 Markdown 引用链 |
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
@@ -136,6 +141,13 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
       {"path_glob": "docs/old/**", "type": "broken_link"},
       {"message_regex": "temporarily unreachable"}
     ]}'
+
+# 8. 引用路径查询（无需先发起校验；起点/目标按导入时的相同规则规范化）
+curl -X POST localhost:8000/api/imports/<import_id>/reference-path \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "README.md", "target": "docs/setup.md"}'
+# => {"import_id": "...", "source": "README.md", "target": "docs/setup.md",
+#     "found": true, "path": ["README.md", "docs/setup.md"], "length": 1}
 ```
 
 修复预览响应：
@@ -158,6 +170,55 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
   "stats": {"documents_rewritten": 1, "edits": 1, "unfixed": 1}
 }
 ```
+
+## 引用路径查询
+
+`POST /api/imports/{import_id}/reference-path` 在导入批次的跨文档引用图上
+查询起点文档到目标文档的**最短 Markdown 引用链**，无需先发起校验，也不产生
+或修改任何诊断：
+
+```json
+{"source": "docs/guide.md", "target": "docs/api.md"}
+```
+
+- **图与校验同源**：引用图复用 `analyzer.analyze`，与校验诊断使用完全相同的
+  文档解析与相对链接解析规则——围栏 / 缩进代码块与行内代码中的链接被跳过，
+  仅被使用的引用式定义计入边，`%20` 等百分号编码先解码，以 `/` 开头的链接按
+  仓库根目录解析，纯片段链接（`#fragment`）属于页内导航、**不产生跨文档边**，
+  外部链接（`http:`、`mailto:`、`//host`）忽略。存在断链的链接不指向集合内
+  文档，因此也不会成为链的一环。
+- **最短与平局裁决**：按边数做广度优先搜索；同一距离层上存在多条等长链时，
+  对**完整路径序列**做字典序比较，选出唯一最小者（如
+  `s → a → t` 与 `s → b → t` 等长时取前者），结果与展开顺序无关、重复调用
+  逐字节一致。
+- **环安全**：已在更短距离上确定的节点不会再次进入搜索，文档间循环引用
+  （含自引用）不会导致查询不终止。
+- **起点等于目标**：返回单元素路径，`length` 为 `0`。
+- **目标不可达**：HTTP 状态码仍为 `200`，响应给出明确空结果：
+  `"found": false`、`"path": []`、`"length": null`。
+
+响应字段：
+
+- `found`：是否存在引用链；
+- `path`：从起点到目标的文档路径序列（不可达时为空数组）；
+- `length`：链上的引用条数，即 `path` 长度减一（不可达时为 `null`）；
+- `source` / `target`：规范化后回显的起点、目标路径。
+
+```json
+{
+  "import_id": "…",
+  "source": "index.md",
+  "target": "docs/api.md",
+  "found": true,
+  "path": ["index.md", "docs/guide.md", "docs/api.md"],
+  "length": 2
+}
+```
+
+错误情况：导入批次不存在返回 `404`（`import not found`）；起点或目标文档
+不在该批次中返回 `404`（`source/target document not found: …`）；路径为
+绝对路径或含 `..` 逃逸返回 `422`；请求体缺字段、空值或含多余字段返回 `422`。
+查询为只读操作，同一请求重复调用结果一致，且不改变任何校验诊断。
 
 ## 校验结果对比
 
@@ -351,6 +412,7 @@ app/
   main.py      # FastAPI 应用与路由，启动时自动初始化数据库
   parser.py    # Markdown 解析：标题/锚点/链接/代码块
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
+  paths.py     # 引用路径查询：BFS 最短引用链 + 路径序列字典序裁决
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射

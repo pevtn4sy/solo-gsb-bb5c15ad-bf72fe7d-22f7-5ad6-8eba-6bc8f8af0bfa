@@ -1088,3 +1088,291 @@ def test_gate_glob_compiler_unit():
     assert _glob_specificity("docs/*.md") > _glob_specificity("*.md")
     assert _glob_specificity("*.md") > _glob_specificity("")
 
+
+# --------------------------------------------------------- reference path --
+
+def _ref_path(client, import_id, source, target):
+    return client.post(
+        f"/api/imports/{import_id}/reference-path",
+        json={"source": source, "target": target},
+    )
+
+
+def test_reference_path_direct_and_multihop(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    assert r.status_code == 201
+    import_id = r.json()["import_id"]
+
+    r = _ref_path(client, import_id, "index.md", "docs/api.md")
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "import_id": import_id,
+        "source": "index.md",
+        "target": "docs/api.md",
+        "found": True,
+        "path": ["index.md", "docs/api.md"],
+        "length": 1,
+    }
+
+    # guide -> index -> api: two-hop chain, chosen over longer routes
+    r = _ref_path(client, import_id, "docs/guide.md", "docs/api.md")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["found"] is True
+    assert body["path"] == ["docs/guide.md", "index.md", "docs/api.md"]
+    assert body["length"] == 2
+
+
+def test_reference_path_unreachable_returns_clear_empty_result(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    import_id = r.json()["import_id"]
+
+    # nothing in the index/guide/api cluster links down to docs/old/deep.md
+    r = _ref_path(client, import_id, "index.md", "docs/old/deep.md")
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "import_id": import_id,
+        "source": "index.md",
+        "target": "docs/old/deep.md",
+        "found": False,
+        "path": [],
+        "length": None,
+    }
+
+
+def test_reference_path_source_equals_target_is_zero_length(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "index.md", "index.md")
+    assert r.status_code == 200
+    assert r.json()["found"] is True
+    assert r.json()["path"] == ["index.md"]
+    assert r.json()["length"] == 0
+
+
+def test_reference_path_ties_resolved_by_path_sequence_lexicographically(client):
+    corpus = {
+        "s.md": "# S\n\n[a](a.md) [b](b.md) [z](z.md).\n",
+        "a.md": "# A\n\nto [t](t.md).\n",
+        "b.md": "# B\n\nto [t](t.md).\n",
+        "z.md": "# Z\n\nto [t](t.md).\n",
+        "t.md": "# T\n",
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "s.md", "t.md")
+    assert r.status_code == 200
+    # three equal-length chains; the smallest path sequence wins
+    assert r.json()["path"] == ["s.md", "a.md", "t.md"]
+    assert r.json()["length"] == 2
+
+
+def test_reference_path_tie_lexicographic_prefix_extension(client):
+    # two equal-length chains sharing part of their sequence; the comparison
+    # must consider the whole path list, not just the first differing edge
+    corpus = {
+        "s.md": "# S\n\n[a](a.md) [z](z.md).\n",
+        "a.md": "# A\n\nto [z](z.md) and [t1](t1.md).\n",
+        "z.md": "# Z\n\nto [t2](t2.md).\n",
+        "t1.md": "# T1\n\n[x](x.md).\n",
+        "t2.md": "# T2\n\n[x](x.md).\n",
+        "x.md": "# X\n",
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "s.md", "x.md")
+    assert r.status_code == 200
+    # two length-3 chains: s,a,t1,x and s,z,t2,x; s,a,z,t2,x is longer.
+    # Full-sequence lexicographic order picks the former (a < z)
+    assert r.json()["path"] == ["s.md", "a.md", "t1.md", "x.md"]
+    assert r.json()["length"] == 3
+
+
+def test_reference_path_cycles_do_not_hang(client):
+    # a <-> b -> c forms a cycle; querying a -> c terminates and the
+    # unreachable c -> a query terminates with an empty result
+    corpus = {
+        "a.md": "# A\n\nto [b](b.md).\n",
+        "b.md": "# B\n\nto [a](a.md) and [c](c.md).\n",
+        "c.md": "# C\n",
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+
+    r = _ref_path(client, import_id, "a.md", "c.md")
+    assert r.status_code == 200
+    assert r.json()["path"] == ["a.md", "b.md", "c.md"]
+    assert r.json()["length"] == 2
+
+    r = _ref_path(client, import_id, "c.md", "a.md")
+    assert r.status_code == 200
+    assert r.json()["found"] is False
+    assert r.json()["path"] == []
+    assert r.json()["length"] is None
+
+
+def test_reference_path_self_loop_does_not_hang(client):
+    corpus = {
+        "a.md": "# A\n\n[self](#a) and [b](b.md).\n",  # fragment-only: no edge
+        "b.md": "# B\n\n[back](a.md).\n",               # cycle a -> b -> a
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "a.md", "b.md")
+    assert r.status_code == 200
+    assert r.json()["path"] == ["a.md", "b.md"]
+    # traversing the cycle back to a is settled already and ignored
+    r = _ref_path(client, import_id, "b.md", "b.md")
+    assert r.status_code == 200
+    assert r.json()["path"] == ["b.md"]
+    assert r.json()["length"] == 0
+
+
+def test_reference_path_broken_links_and_fragments_do_not_create_edges(client):
+    corpus = {
+        "a.md": "# A\n\n[missing](nope.md) [frag](#a) [ext](https://example.com/x).\n",
+        "b.md": "# B\n",
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "a.md", "b.md")
+    assert r.status_code == 200
+    assert r.json()["found"] is False
+
+
+def test_reference_path_reuses_relative_resolution_rules(client):
+    # percent-encoded spaces, parent-dir links and root-absolute links
+    corpus = {
+        "docs/a.md": "# A\n\n[x](<my file.md>) [up](../index.md) [root](/docs/b.md).\n",
+        "docs/my file.md": "# M\n",
+        "index.md": "# I\n",
+        "docs/b.md": "# B\n",
+    }
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    import_id = r.json()["import_id"]
+    for target in ("docs/my file.md", "index.md", "docs/b.md"):
+        body = _ref_path(client, import_id, "docs/a.md", target).json()
+        assert body["found"] is True, target
+        assert body["path"][-1] == target
+
+
+def test_reference_path_normalizes_input_paths(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    import_id = r.json()["import_id"]
+    r = _ref_path(client, import_id, "./index.md", "docs/./api.md")
+    assert r.status_code == 200, r.text
+    assert r.json()["source"] == "index.md"
+    assert r.json()["target"] == "docs/api.md"
+    assert r.json()["path"][0] == "index.md"
+
+
+def test_reference_path_query_does_not_change_diagnostics(client):
+    import_id, vid, before = import_and_validate(client, CORPUS)
+    _ref_path(client, import_id, "index.md", "docs/api.md")
+    _ref_path(client, import_id, "docs/old/deep.md", "docs/api.md")
+    after = client.get(f"/api/validations/{vid}").json()
+    assert after["summary"] == before["summary"]
+    assert after["diagnostics"] == before["diagnostics"]
+
+
+def test_reference_path_query_is_repeatable(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    import_id = r.json()["import_id"]
+    first = _ref_path(client, import_id, "index.md", "docs/api.md").json()
+    second = _ref_path(client, import_id, "index.md", "docs/api.md").json()
+    assert first == second
+
+
+def test_reference_path_errors(client):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in CORPUS.items()]},
+    )
+    import_id = r.json()["import_id"]
+
+    assert _ref_path(client, "does-not-exist", "a.md", "b.md").status_code == 404
+
+    r = _ref_path(client, import_id, "nope.md", "index.md")
+    assert r.status_code == 404
+    assert "source document not found" in r.json()["detail"]
+
+    r = _ref_path(client, import_id, "index.md", "nope.md")
+    assert r.status_code == 404
+    assert "target document not found" in r.json()["detail"]
+
+    assert _ref_path(client, import_id, "../x.md", "index.md").status_code == 422
+    assert _ref_path(client, import_id, "index.md", "/abs.md").status_code == 422
+
+    # malformed body: missing field, empty value, unknown field
+    assert client.post(
+        f"/api/imports/{import_id}/reference-path", json={"source": "index.md"}
+    ).status_code == 422
+    assert client.post(
+        f"/api/imports/{import_id}/reference-path",
+        json={"source": "", "target": "index.md"},
+    ).status_code == 422
+    assert client.post(
+        f"/api/imports/{import_id}/reference-path",
+        json={"source": "index.md", "target": "index.md", "extra": 1},
+    ).status_code == 422
+
+
+def test_shortest_reference_chain_engine_unit():
+    from app.paths import shortest_reference_chain
+
+    # diamond: s -> {a, b} -> t ; a < b lexicographically
+    docs = {
+        "s.md": "# S\n\n[a](a.md) [b](b.md).\n",
+        "a.md": "# A\n\n[t](t.md).\n",
+        "b.md": "# B\n\n[t](t.md).\n",
+        "t.md": "# T\n",
+        "iso.md": "# I\n",
+    }
+    result = shortest_reference_chain(docs, "s.md", "t.md")
+    assert result["found"] is True
+    assert result["path"] == ["s.md", "a.md", "t.md"]
+    assert result["length"] == 2
+
+    result = shortest_reference_chain(docs, "s.md", "iso.md")
+    assert result == {
+        "source": "s.md",
+        "target": "iso.md",
+        "found": False,
+        "path": [],
+        "length": None,
+    }
+
+
