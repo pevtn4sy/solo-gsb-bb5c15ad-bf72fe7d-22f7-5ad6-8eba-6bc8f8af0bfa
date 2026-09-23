@@ -20,6 +20,11 @@ Markdown 文档，服务解析相对链接、标题锚点与代码块，建立�
   | `anchor_collision` | warning/error | 多个标题共享同一锚点（歧义）或锚点重复定义 |
   | `cycle` | warning | 文档间循环引用（强连通分量，含自引用） |
 - **校验任务**：校验在后台任务中执行，可查询任务状态与诊断（支持按类型/路径过滤）。
+- **引用链查询**：在导入批次的引用图上查询两篇文档之间的最短 Markdown 引用链
+  （`GET /api/imports/{import_id}/reference-path?from=...&to=...`）；存在多条等长
+  最短链时按路径序列字典序选定唯一结果，引用环路不会导致查询不终止，目标不可达
+  时返回明确的空结果。查询与校验共用同一份解析与相对链接解析规则，只读、不产生
+  诊断。
 - **结果对比**：对两次 `done` 状态的校验，按稳定指纹（`type`、`severity`、
   `path`、`line`、`message`、`details`）计算新增 / 移除 / 未变化诊断，并报告
   两次导入之间文档的新增、删除与内容变化路径（`POST /api/validations/compare`）。
@@ -89,6 +94,7 @@ pytest
 | `POST` | `/api/imports` | 导入文档集合 → `import_id` |
 | `GET` | `/api/imports/{import_id}` | 查看导入批次与文档路径 |
 | `GET` | `/api/imports/{import_id}/documents/{path}` | 读取单个文档 |
+| `GET` | `/api/imports/{import_id}/reference-path` | 查询两篇文档间的最短引用链（`?from=`、`?to=`） |
 | `POST` | `/api/validations` | 对某导入批次发起校验（后台任务）→ `validation_id` |
 | `GET` | `/api/validations` | 最近校验任务列表 |
 | `GET` | `/api/validations/{validation_id}` | 任务状态 + 诊断（`?type=`、`?path=` 过滤） |
@@ -136,6 +142,11 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
       {"path_glob": "docs/old/**", "type": "broken_link"},
       {"message_regex": "temporarily unreachable"}
     ]}'
+
+# 8. 查询最短引用链（只依赖导入批次，无需先跑校验）
+curl 'localhost:8000/api/imports/<import_id>/reference-path?from=README.md&to=docs/setup.md'
+# => {"import_id": "...", "from": "README.md", "to": "docs/setup.md",
+#     "found": true, "hops": 1, "path": ["README.md", "docs/setup.md"]}
 ```
 
 修复预览响应：
@@ -158,6 +169,41 @@ curl -X POST localhost:8000/api/validations/<validation_id>/gate \
   "stats": {"documents_rewritten": 1, "edits": 1, "unfixed": 1}
 }
 ```
+
+## 引用链查询
+
+`GET /api/imports/{import_id}/reference-path?from=<起点>&to=<目标>` 在导入批次的
+引用图上查询两篇文档之间的最短 Markdown 引用链。查询只依赖导入批次本身，无需
+先运行校验任务，也不修改任何数据。
+
+- **图语义与校验一致**：引用图复用校验的解析与相对链接解析规则——行内链接、
+  图片与被实际引用的 reference-style 定义产生有向边；仅含 `#fragment` 的页内
+  链接、外部链接（`http:` 等）与指向未导入文档的断链不产生边。
+- **最短且唯一**：返回经过边数最少的链；存在多条等长最短链时，按路径序列的
+  字典序（逐段比较文档路径）选定唯一结果，重复查询结果一致。
+- **环路安全**：引用环（如 `a.md` ↔ `b.md`、自引用）不会导致查询不终止，
+  每篇文档在搜索中至多处理一次。
+- **起点即目标**：`from` 与 `to` 相同时返回零跳链 `["x.md"]`（`hops` 为 0）。
+
+`from` / `to` 两个查询参数均为必填，路径按与导入相同的规则规范化（`./`、
+`../` 折叠等）。响应字段：
+
+| 字段 | 说明 |
+|---|---|
+| `found` | 是否可达 |
+| `hops` | 链的边数（`len(path) - 1`）；不可达时为 `null` |
+| `path` | 从起点到目标的文档路径序列；不可达时为空数组 `[]` |
+
+目标不可达时返回 `200` 与明确的空结果：
+
+```json
+{"import_id": "…", "from": "index.md", "to": "island.md",
+ "found": false, "hops": null, "path": []}
+```
+
+错误码：导入批次不存在返回 `404`（`import not found`）；起点或目标文档不在
+批次中返回 `404`（`document not found: '<path>'`）；路径非法（绝对路径、
+`..` 逃逸、空路径）或缺少查询参数返回 `422`。
 
 ## 校验结果对比
 
@@ -351,6 +397,7 @@ app/
   main.py      # FastAPI 应用与路由，启动时自动初始化数据库
   parser.py    # Markdown 解析：标题/锚点/链接/代码块
   analyzer.py  # 引用图构建与诊断（断链/断锚/碰撞/环）
+  refpath.py   # 引用链查询：引用图上的最短链（字典序决胜、环路安全）
   comparison.py# 两次校验结果对比：诊断指纹差分 + 文档集合差分
   fixer.py     # 修复预览：最小化重写锚点与引用
   sarif.py     # SARIF 2.1.0 导出：诊断 -> runs/results 映射

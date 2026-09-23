@@ -1088,3 +1088,168 @@ def test_gate_glob_compiler_unit():
     assert _glob_specificity("docs/*.md") > _glob_specificity("*.md")
     assert _glob_specificity("*.md") > _glob_specificity("")
 
+
+# -------------------------------------------------------- reference path ----
+
+CHAIN_CORPUS = {
+    "index.md": "# Home\n\nSee [b](b.md) and [c](c.md).\n",
+    "b.md": "# B\n\nTo [d](d.md).\n",
+    "c.md": "# C\n\nTo [d](d.md) too.\n",
+    # d links back to index: the graph contains a cycle
+    "d.md": "# D\n\nBack to [home](index.md).\n",
+    "island.md": "# Island\n\nNo outgoing links.\n",
+}
+
+
+def import_only(client, corpus):
+    r = client.post(
+        "/api/imports",
+        json={"documents": [{"path": p, "content": c} for p, c in corpus.items()]},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["import_id"]
+
+
+def reference_path(client, import_id, from_, to):
+    return client.get(
+        f"/api/imports/{import_id}/reference-path",
+        params={"from": from_, "to": to},
+    )
+
+
+def test_reference_path_returns_shortest_chain(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    r = reference_path(client, import_id, "index.md", "d.md")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["import_id"] == import_id
+    assert body["from"] == "index.md"
+    assert body["to"] == "d.md"
+    assert body["found"] is True
+    # two equal shortest chains exist (via b.md / via c.md); the
+    # lexicographically smallest path sequence wins
+    assert body["path"] == ["index.md", "b.md", "d.md"]
+    assert body["hops"] == 2
+
+
+def test_reference_path_tie_breaks_at_deeper_levels(client):
+    corpus = {
+        "s.md": "# S\n\n[to b](b.md) and [to a](a.md).\n",
+        "b.md": "# B\n\n[to y](y.md).\n",
+        "a.md": "# A\n\n[to z](z.md).\n",
+        "y.md": "# Y\n\n[to t](t.md).\n",
+        "z.md": "# Z\n\n[to t](t.md).\n",
+        "t.md": "# T\n",
+    }
+    import_id = import_only(client, corpus)
+    body = reference_path(client, import_id, "s.md", "t.md").json()
+    # [s,a,z,t] and [s,b,y,t] are both shortest; 'a' < 'b' decides
+    assert body["path"] == ["s.md", "a.md", "z.md", "t.md"]
+    assert body["hops"] == 3
+
+
+def test_reference_path_terminates_despite_cycles(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    # d -> index -> b -> d is a cycle; the query must still terminate and
+    # report the direct edge as the shortest chain
+    body = reference_path(client, import_id, "d.md", "b.md").json()
+    assert body["found"] is True
+    assert body["path"] == ["d.md", "index.md", "b.md"]
+    # self-loop documents still yield the trivial zero-hop chain
+    loop_id = import_only(client, {"loop.md": "# L\n\n[self](loop.md).\n"})
+    body = reference_path(client, loop_id, "loop.md", "loop.md").json()
+    assert body == {
+        "import_id": loop_id,
+        "from": "loop.md",
+        "to": "loop.md",
+        "found": True,
+        "hops": 0,
+        "path": ["loop.md"],
+    }
+
+
+def test_reference_path_unreachable_returns_empty_result(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    r = reference_path(client, import_id, "index.md", "island.md")
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "import_id": import_id,
+        "from": "index.md",
+        "to": "island.md",
+        "found": False,
+        "hops": None,
+        "path": [],
+    }
+    # edges are directed: the island cannot reach back either
+    assert reference_path(client, import_id, "island.md", "index.md").json()[
+        "found"
+    ] is False
+
+
+def test_reference_path_uses_validation_edge_rules(client):
+    corpus = {
+        # fragment-only, external and broken links never create edges;
+        # used reference-style definitions do
+        "a.md": (
+            "# A\n\n"
+            "[self](#a) [ext](https://example.com/x.md) [gone](nope.md) "
+            "[via ref][r].\n\n"
+            "[r]: b.md\n"
+        ),
+        "b.md": "# B\n\n[anchor only](#b).\n",
+    }
+    import_id = import_only(client, corpus)
+    body = reference_path(client, import_id, "a.md", "b.md").json()
+    assert body["path"] == ["a.md", "b.md"]
+    # b has no outgoing edges (its only link is fragment-only)
+    assert reference_path(client, import_id, "b.md", "a.md").json()[
+        "found"
+    ] is False
+
+
+def test_reference_path_normalizes_query_paths(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    body = reference_path(client, import_id, "./index.md", "sub/../d.md").json()
+    assert body["from"] == "index.md"
+    assert body["to"] == "d.md"
+    assert body["path"] == ["index.md", "b.md", "d.md"]
+
+
+def test_reference_path_unknown_import_or_document_returns_404(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    r = reference_path(client, "does-not-exist", "index.md", "d.md")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "import not found"
+
+    r = reference_path(client, import_id, "index.md", "ghost.md")
+    assert r.status_code == 404
+    assert "ghost.md" in r.json()["detail"]
+    r = reference_path(client, import_id, "ghost.md", "index.md")
+    assert r.status_code == 404
+    assert "ghost.md" in r.json()["detail"]
+
+
+def test_reference_path_rejects_invalid_requests(client):
+    import_id = import_only(client, CHAIN_CORPUS)
+    # missing query parameters
+    assert client.get(f"/api/imports/{import_id}/reference-path").status_code == 422
+    assert (
+        reference_path(client, import_id, "index.md", "").status_code == 422
+    )
+    # absolute paths and root escapes are rejected like at import time
+    assert reference_path(client, import_id, "/abs.md", "d.md").status_code == 422
+    assert (
+        reference_path(client, import_id, "index.md", "../esc.md").status_code
+        == 422
+    )
+
+
+def test_reference_path_does_not_affect_validation(client):
+    # querying chains must not change the import or any validation results
+    import_id, vid, body = import_and_validate(client, CORPUS)
+    before = client.get(f"/api/validations/{vid}").json()
+    reference_path(client, import_id, "index.md", "docs/api.md")
+    after = client.get(f"/api/validations/{vid}").json()
+    assert before == after
+    assert body["summary"]["diagnostics"] == 8
+

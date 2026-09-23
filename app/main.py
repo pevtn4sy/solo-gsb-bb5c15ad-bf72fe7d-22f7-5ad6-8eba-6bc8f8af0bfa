@@ -11,6 +11,7 @@ from .analyzer import analyze
 from .comparison import build_comparison
 from .fixer import build_fix_preview
 from .gate import GateRequestError, compile_gate_request, evaluate_gate
+from .refpath import shortest_reference_path
 from .sarif import build_sarif
 from .schemas import (
     GateRequest,
@@ -88,6 +89,37 @@ def get_document(import_id: str, path: str) -> dict:
     if content is None:
         raise HTTPException(status_code=404, detail="document not found")
     return {"path": path, "content": content}
+
+
+# --------------------------------------------------------- reference path ---
+
+@app.get("/api/imports/{import_id}/reference-path")
+def reference_path(
+    import_id: str,
+    from_: str = Query(alias="from"),
+    to: str = Query(),
+) -> dict:
+    """Shortest Markdown reference chain between two imported documents."""
+    if not db.get_import(import_id):
+        raise HTTPException(status_code=404, detail="import not found")
+    try:
+        start = normalize_doc_path(from_)
+        target = normalize_doc_path(to)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    documents = db.get_documents(import_id)
+    for p in (start, target):
+        if p not in documents:
+            raise HTTPException(status_code=404, detail=f"document not found: {p!r}")
+    chain = shortest_reference_path(documents, start, target)
+    return {
+        "import_id": import_id,
+        "from": start,
+        "to": target,
+        "found": chain is not None,
+        "hops": len(chain) - 1 if chain is not None else None,
+        "path": chain if chain is not None else [],
+    }
 
 
 # ------------------------------------------------------------ validations ---
